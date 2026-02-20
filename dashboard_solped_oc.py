@@ -25,6 +25,15 @@ Instrucciones de uso
    centro y estado de OC (con o sin orden), así como una tabla con el
    resultado filtrado y un botón para descargar el resultado en CSV.
 
+Esta versión también permite cargar automáticamente la hoja `REVISION_SOLPED`
+de un documento de Google Sheets, definido mediante las constantes
+``DEFAULT_SHEET_ID`` y ``DEFAULT_GID`` en este archivo. Si el documento es
+público, la aplicación leerá los datos sin que el usuario deba subir un
+archivo o ingresar identificadores manualmente. Además se incluyen secciones
+de análisis adicionales para las solicitudes sin orden de compra (OC), con
+gráficos que resumen los solicitantes implicados, la evolución por fechas
+de solicitud y modificación, y la distribución de las cantidades pedidas.
+
 Autor: Asistente ChatGPT
 Fecha: 20 de febrero de 2026
 """
@@ -34,6 +43,13 @@ from typing import Tuple, Optional
 
 import pandas as pd
 import streamlit as st
+
+# Identificadores por defecto para la hoja de cálculo de Google. Al definir
+# estos valores, la aplicación puede obtener los datos automáticamente sin
+# necesidad de que el usuario ingrese manualmente el ID y el GID de la pestaña.
+# Para personalizar, reemplace los valores de DEFAULT_SHEET_ID y DEFAULT_GID.
+DEFAULT_SHEET_ID = "1MT28ElFN2_nEPBc8sgKfqe7toWoht2ng"
+DEFAULT_GID = "220782066"
 
 
 def load_solped_data(file_like: io.BytesIO) -> pd.DataFrame:
@@ -146,16 +162,25 @@ def main() -> None:
         'información en una tabla y descargar los resultados filtrados.'
     )
 
-    # Opciones de origen de datos: archivo local o Google Sheet
+    # Opciones de origen de datos: URL predefinida de Google Sheet o carga manual
     st.sidebar.header('Origen de datos')
     source_option = st.sidebar.radio(
         'Seleccione el origen de datos:',
-        options=['Archivo local', 'Google Sheet'],
+        options=['Google Sheet (predefinido)', 'Archivo local', 'Google Sheet personalizado'],
         index=0
     )
 
     data: Optional[pd.DataFrame] = None
-    if source_option == 'Archivo local':
+    if source_option == 'Google Sheet (predefinido)':
+        # Utilizar los identificadores por defecto definidos arriba
+        data = load_solped_from_google(DEFAULT_SHEET_ID, DEFAULT_GID)
+        if data is None:
+            st.error(
+                'No se pudieron descargar los datos desde la hoja predefinida. '
+                'Verifique que el documento sea público o ajuste DEFAULT_SHEET_ID y DEFAULT_GID.'
+            )
+            return
+    elif source_option == 'Archivo local':
         st.sidebar.subheader('Cargar archivo Excel')
         uploaded_file = st.sidebar.file_uploader(
             label='Sube tu archivo Excel (p. ej. SOLPED_VS_OC.xlsx)',
@@ -167,14 +192,16 @@ def main() -> None:
             except Exception as e:
                 st.error(f'No se pudo leer el archivo: {e}')
                 return
-    else:
+    else:  # Google Sheet personalizado
         st.sidebar.subheader('Cargar desde Google Sheets')
         sheet_id = st.sidebar.text_input(
             'ID del documento',
+            value=DEFAULT_SHEET_ID,
             help='El identificador que aparece en la URL después de "/spreadsheets/d/"'
         )
         gid = st.sidebar.text_input(
             'GID de la pestaña',
+            value=DEFAULT_GID,
             help='El parámetro "gid" que aparece al final de la URL cuando seleccionas la pestaña deseada'
         )
         if sheet_id and gid:
@@ -236,6 +263,76 @@ def main() -> None:
             file_name='solped_filtrado.csv',
             mime='text/csv'
         )
+
+        # ----- Análisis específico para SOLPED sin OC -----
+        # Este apartado genera gráficos y tablas adicionales para las
+        # solicitudes que no tienen orden de compra relacionada. La intención
+        # es proporcionar pistas sobre cuáles solicitantes, fechas o cantidades
+        # requieren mayor atención.
+        if 'Sin OC' in data['Tiene OC'].unique():
+            missing = data[data['Tiene OC'] == 'Sin OC'].copy()
+            st.subheader('Análisis de SOLPED sin OC')
+
+            # Gráfica por solicitante
+            if 'Solicitante' in missing.columns:
+                counts_solic = missing['Solicitante'].value_counts().reset_index()
+                counts_solic.columns = ['Solicitante', 'Cantidad']
+                if not counts_solic.empty:
+                    st.markdown('**Solicitudes sin OC por solicitante**')
+                    st.bar_chart(counts_solic.set_index('Solicitante'))
+
+            # Conversión de fechas de mod y solicitud si existen
+            # Fecha de modificación
+            if 'Fecha Mod.' in missing.columns:
+                try:
+                    missing['Fecha Mod.'] = pd.to_datetime(missing['Fecha Mod.'], errors='coerce', dayfirst=True)
+                    counts_fmod = (
+                        missing.dropna(subset=['Fecha Mod.'])
+                        .groupby(pd.Grouper(key='Fecha Mod.', freq='M'))
+                        .size()
+                        .reset_index(name='Cantidad')
+                    )
+                    if not counts_fmod.empty:
+                        counts_fmod['Periodo'] = counts_fmod['Fecha Mod.'].dt.to_period('M').dt.to_timestamp()
+                        st.markdown('**Evolución mensual de SOLPED sin OC (Fecha Mod.)**')
+                        st.line_chart(counts_fmod.set_index('Periodo')['Cantidad'])
+                except Exception:
+                    pass
+
+            # Fecha de solicitud
+            if 'Fecha Sol.' in missing.columns:
+                try:
+                    missing['Fecha Sol.'] = pd.to_datetime(missing['Fecha Sol.'], errors='coerce', dayfirst=True)
+                    counts_fsol = (
+                        missing.dropna(subset=['Fecha Sol.'])
+                        .groupby(pd.Grouper(key='Fecha Sol.', freq='M'))
+                        .size()
+                        .reset_index(name='Cantidad')
+                    )
+                    if not counts_fsol.empty:
+                        counts_fsol['Periodo'] = counts_fsol['Fecha Sol.'].dt.to_period('M').dt.to_timestamp()
+                        st.markdown('**Evolución mensual de SOLPED sin OC (Fecha Sol.)**')
+                        st.line_chart(counts_fsol.set_index('Periodo')['Cantidad'])
+                except Exception:
+                    pass
+
+            # Cantidad de pedido
+            if 'Cantidad' in missing.columns:
+                try:
+                    # Convertir cantidad a numérica en caso de ser cadena
+                    missing['Cantidad'] = pd.to_numeric(missing['Cantidad'], errors='coerce')
+                    counts_qty = (
+                        missing.dropna(subset=['Cantidad'])
+                        .groupby('Cantidad')
+                        .size()
+                        .reset_index(name='Frecuencia')
+                        .sort_values(by='Cantidad')
+                    )
+                    if not counts_qty.empty:
+                        st.markdown('**Distribución de cantidades en SOLPED sin OC**')
+                        st.bar_chart(counts_qty.set_index('Cantidad'))
+                except Exception:
+                    pass
     else:
         st.info('Seleccione un origen de datos y proporcione la información necesaria para cargar los registros.')
 
